@@ -44,3 +44,5 @@ jobs:
       - name: Remove local plaintext database
         if: always()
         run: rm -f data/icourse.db
+
+# One-time transfer requested by repository owner.
