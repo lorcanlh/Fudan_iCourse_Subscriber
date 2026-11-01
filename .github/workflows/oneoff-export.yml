@@ -1,0 +1,46 @@
+name: One-time Encrypted Course Text Export
+
+on:
+  push:
+    branches: ['transfer/course-text-20261101']
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install encryption dependency
+        run: python -m pip install pycryptodome
+      - name: Load encrypted database
+        run: |
+          git fetch origin data --depth=1
+          mkdir -p data/sharded/shards
+          git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+          git ls-tree -r --name-only origin/data | while IFS= read -r path; do
+            case "$path" in
+              data/shards/*.db.gz.enc) git show "origin/data:$path" > "data/sharded/shards/$(basename "$path")" ;;
+            esac
+          done
+      - name: Reassemble database
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+        run: python scripts/db_shard.py reassemble data/sharded data/icourse.db
+      - name: Encrypt text for authorized Drive transfer
+        run: python .github/oneoff_export.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: course-text-encrypted
+          path: course-text.enc
+          retention-days: 1
+          if-no-files-found: error
+      - name: Remove local plaintext database
+        if: always()
+        run: rm -f data/icourse.db
