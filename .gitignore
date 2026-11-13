@@ -53,3 +53,5 @@ db-viewer/
 # .github/
 # Shard inspection temp files
 _shard_inspect/
+drive-oauth.secret.json
+*client_secret*.json
