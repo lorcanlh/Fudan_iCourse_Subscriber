@@ -1,0 +1,121 @@
+name: Sync Course Text to Google Drive
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["iCourse Check", "Single Run"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: "17 12 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: google-drive-course-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Never consume code or artifacts from untrusted PR/fork runs.
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.event != 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check Google Drive configuration
+        id: config
+        env:
+          DRIVE_OAUTH: ${{ secrets.GOOGLE_DRIVE_OAUTH_JSON }}
+        run: |
+          if [ -n "$DRIVE_OAUTH" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Google Drive sync is not configured. Add GOOGLE_DRIVE_OAUTH_JSON; see docs/google-drive-sync.md."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          ref: main
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        if: steps.config.outputs.enabled == 'true'
+        with:
+          python-version: '3.12'
+      - name: Install sync dependencies
+        if: steps.config.outputs.enabled == 'true'
+        run: python -m pip install requests pycryptodome
+
+      - name: Fetch database from data branch
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          mkdir -p data
+          git fetch origin data --depth=1
+          if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            mkdir -p data/sharded/shards
+            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/sharded/shards/$base"
+            done
+            echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
+          elif git cat-file -e origin/data:data/icourse.db.gz.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
+            echo "Loaded legacy compressed database."
+          elif git cat-file -e origin/data:data/icourse.db.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
+            echo "Loaded legacy uncompressed database."
+          else
+            echo "::error::No database found on data branch."
+            exit 1
+          fi
+
+      - name: Decode database
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          if [ -f data/sharded/icourse-index.enc ]; then
+            python scripts/db_shard.py reassemble data/sharded data/icourse.db
+            echo "Reassembled sharded database."
+            exit 0
+          fi
+
+          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
+          LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
+
+          decrypt_blob() {
+            local in_path="$1"
+            local out_path="$2"
+            if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
+                 -in "$in_path" -out "$out_path" \
+                 -pass pass:"$NEW_KEY" 2>/dev/null; then
+              return 0
+            fi
+            openssl enc -aes-256-cbc -d -pbkdf2 \
+              -in "$in_path" -out "$out_path" \
+              -pass pass:"$LEGACY_KEY" 2>/dev/null
+          }
+
+          if [ -f data/icourse.db.gz.enc ]; then
+            decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz
+            gzip -d data/icourse.db.gz
+          else
+            decrypt_blob data/icourse.db.enc data/icourse.db
+          fi
+          echo "Database decrypted."
+
+      - name: Sync existing transcripts and AI analyses
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          GOOGLE_DRIVE_OAUTH_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_JSON }}
+          GOOGLE_DRIVE_PARENT_ID: ${{ vars.GOOGLE_DRIVE_PARENT_ID }}
+          GOOGLE_DRIVE_START_DATE: ${{ vars.GOOGLE_DRIVE_START_DATE || '2026-09-01' }}
+          GOOGLE_DRIVE_END_DATE: ${{ vars.GOOGLE_DRIVE_END_DATE }}
+          GOOGLE_DRIVE_TERM: ${{ vars.GOOGLE_DRIVE_TERM || '2026-2027 秋季学期' }}
+          GOOGLE_DRIVE_COURSE_IDS: ${{ vars.GOOGLE_DRIVE_COURSE_IDS }}
+        run: python scripts/sync_drive.py
